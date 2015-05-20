@@ -13,10 +13,10 @@ except ImportError:     # Python 2
 from django.contrib.staticfiles import utils
 
 try:
-    from django.core.handlers.wsgi import get_path_info
+    from django.core.handlers.wsgi import get_path_info, get_script_name
 except ImportError:  # django < 1.7
     try:
-        from django.core.handlers.base import get_path_info
+        from django.core.handlers.base import get_path_info, get_script_name
     except ImportError:     # django < 1.5
         import sys
         py3 = sys.version_info[0] == 3
@@ -32,6 +32,27 @@ except ImportError:  # django < 1.7
                 path_info = path_info.encode('iso-8859-1')
             # It'd be better to implement URI-to-IRI decoding, see #19508.
             return path_info.decode('utf-8')
+
+        def get_script_name(environ):
+            """
+            Returns the equivalent of the HTTP request's SCRIPT_NAME environment
+            variable. See the Django source code of Django >1.5 for details.
+            """
+            if settings.FORCE_SCRIPT_NAME is not None:
+                return force_text(settings.FORCE_SCRIPT_NAME)
+        
+            # Tweaks for Apache
+            script_url = environ.get('SCRIPT_URL', environ.get('REDIRECT_URL', str('')))
+            if script_url:
+                script_name = script_url[:-len(environ.get('PATH_INFO', str('')))]
+            else:
+                script_name = environ.get('SCRIPT_NAME', str(''))
+            # Under Python 3, strings in environ are decoded with ISO-8859-1;
+            # re-encode to recover the original bytestring provided by the web server.
+            if six.PY3:
+                script_name = script_name.encode('iso-8859-1')
+            # It'd be better to implement URI-to-IRI decoding, see #19508.
+            return script_name.decode('utf-8')
 
 
 class Cling(WSGIHandler):
@@ -66,20 +87,27 @@ class Cling(WSGIHandler):
 
     def _transpose_environ(self, environ):
         """Translates a given environ to static.Cling's expectations."""
-        environ['PATH_INFO'] = environ['PATH_INFO'][len(self.base_url[2]) - 1:]
+        script_name = get_script_name(environ).rstrip('/')
+        environ['PATH_INFO'] = environ['PATH_INFO'][len(self.base_url[2]) - len(script_name) - 1:]
         return environ
 
-    def _should_handle(self, path):
+    def _should_handle(self, environ):
         """Checks if the path should be handled. Ignores the path if:
 
         * the host is provided as part of the base_url
         * the request's path isn't under the media path (or equal)
         """
-        return path.startswith(self.base_url[2]) and not self.base_url[1]
+        path = get_path_info(environ)
+        script_name = get_script_name(environ)
+        real_path = '%s/%s' % (
+            script_name.rstrip('/'),
+            path.replace('/', '', 1)
+        )
+        return real_path.startswith(self.base_url[2]) and not self.base_url[1]
 
     def __call__(self, environ, start_response):
         # Hand non-static requests to Django
-        if not self._should_handle(get_path_info(environ)):
+        if not self._should_handle(environ):
             return self.application(environ, start_response)
 
         # Serve static requests from static.Cling
